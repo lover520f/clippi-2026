@@ -4,6 +4,7 @@ pub mod color;
 pub mod db;
 pub mod filters;
 pub mod frontend;
+pub mod image_cache;
 pub mod paths;
 pub mod settings;
 pub mod sync;
