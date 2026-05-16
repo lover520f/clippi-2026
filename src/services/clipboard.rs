@@ -700,6 +700,40 @@ impl ClipboardService {
         self.model.clear();
         self.entry_cache.clear();
     }
+
+    const LOAD_MORE_BATCH: usize = 40;
+
+    /// Load more items into the model (called when user scrolls near bottom).
+    pub fn load_more_items(&mut self) {
+        let current = self.model.row_count();
+        if current == 0 {
+            return;
+        }
+        let order_by = if self.sort_by_created { "created_at" } else { "updated_at" };
+        let new_limit = current + Self::LOAD_MORE_BATCH;
+        let limit = if self.max_items == 0 { new_limit } else { self.max_items.min(new_limit) };
+        if limit <= current {
+            return; // Already loaded everything
+        }
+        let items = {
+            if let Ok(db) = self.db.lock() {
+                db.load_filtered_with_tags(&self.filters, limit, order_by)
+                    .unwrap_or_default()
+            } else {
+                vec![]
+            }
+        };
+        if items.len() <= current {
+            return;
+        }
+        for item in &items[current..] {
+            let entry = self.get_or_create_entry(item);
+            self.model.push(entry);
+        }
+        if let Some(app) = self.app.upgrade() {
+            app.set_item_count(self.model.row_count() as i32);
+        }
+    }
 }
 
 impl Pollable for ClipboardService {

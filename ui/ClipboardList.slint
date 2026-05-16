@@ -1,4 +1,4 @@
-import { ListView } from "std-widgets.slint";
+import { ScrollView } from "std-widgets.slint";
 import { ClipboardEntry } from "types.slint";
 
 export component ClipboardList inherits Rectangle {
@@ -61,6 +61,7 @@ export component ClipboardList inherits Rectangle {
     callback show-tag-picker(int);
     callback hide-tag-picker();
     callback hide-tag-filter-panel();
+    callback load-more();
 
     // ========== 主题色板 ==========
     property <color> surface:       dark-mode ? #232425 : #ffffff;
@@ -397,8 +398,9 @@ export component ClipboardList inherits Rectangle {
                 }
 
                 // 剪贴板列表
-                clip-list := ListView {
-                    for entry in root.items: VerticalLayout {
+                clip-list := ScrollView {
+                    VerticalLayout {
+                        for entry in root.items: card_layout := VerticalLayout {
                         padding: 5px;
 
                         card-rect := Rectangle {
@@ -1389,6 +1391,21 @@ export component ClipboardList inherits Rectangle {
                         }
                         }
                     }
+
+                    // Sentinel — fires load-more when user scrolls to bottom
+                    if root.items.length > 0 : Rectangle {
+                        height: 40px;
+                        load-more-ta := TouchArea {
+                            height: 40px;
+                            mouse-cursor: default;
+                            changed has-hover => {
+                                if self.has-hover {
+                                    root.load-more();
+                                }
+                            }
+                        }
+                    }
+                }
                 }
         }
     }

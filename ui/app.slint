@@ -199,6 +199,7 @@ export component App inherits Window {
     callback batch-add-tag(int);
     callback batch-remove-tag(int);
     callback clear-all-tags();
+    callback load-more();
 
     // ========== 主题色板 ==========
     property <color> bg:            dark-mode ? #191a1b : #f2f3f8;
@@ -468,6 +469,7 @@ export component App inherits Window {
                     show-tag-picker(id) => { root.show-tag-picker(id); }
                     hide-tag-picker => { root.hide-tag-picker(); }
                     hide-tag-filter-panel => { root.hide-tag-filter-panel(); }
+                    load-more => { root.load-more(); }
                 }
 
                 EditPanel {

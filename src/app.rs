@@ -853,6 +853,13 @@ impl AppController {
                 }
             });
         });
+
+        let c = ctx.clone();
+        slint_app.on_load_more(move || {
+            let _ = c.looper.try_with_clipboard_service(|cs| {
+                cs.load_more_items();
+            });
+        });
     }
 
     // ── Context menu callbacks ──
