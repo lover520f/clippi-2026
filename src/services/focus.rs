@@ -7,6 +7,7 @@ use crate::platform::focus::{get_foreground_app_info, start_focus_watcher, Focus
 use crate::App;
 use slint::{ComponentHandle, Image, SharedString};
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Shared current foreground app name for cross-service coordination.
 pub type ForegroundAppName = Arc<Mutex<String>>;
@@ -25,6 +26,7 @@ pub struct FocusService {
     last_fg_app_name: String,
     auto_hide: bool,
     pinned: bool,
+    needs_release: Arc<AtomicBool>,
 }
 
 impl FocusService {
@@ -32,6 +34,7 @@ impl FocusService {
         frontend: Arc<Mutex<Frontend>>,
         app: slint::Weak<App>,
         foreground_app_name: ForegroundAppName,
+        needs_release: Arc<AtomicBool>,
     ) -> Result<Self, String> {
         let watcher = start_focus_watcher()?;
         Ok(Self {
@@ -42,6 +45,7 @@ impl FocusService {
             last_fg_app_name: String::new(),
             auto_hide: true,
             pinned: false,
+            needs_release,
         })
     }
 
@@ -137,6 +141,7 @@ impl Pollable for FocusService {
         // All conditions met, hide the window
         if let Ok(mut fe) = self.frontend.lock() {
             fe.hide();
+            self.needs_release.store(true, Ordering::SeqCst);
         }
     }
 

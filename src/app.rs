@@ -37,6 +37,7 @@ struct CallbackCtx {
     copy_as_plain_text: Arc<AtomicBool>,
     batch_pasting: Arc<AtomicBool>,
     clear_selection: Arc<AtomicBool>,
+    needs_release: Arc<AtomicBool>,
 }
 
 pub struct AppController {
@@ -81,6 +82,7 @@ impl AppController {
         let clipboard_shared = ClipboardShared::new();
         let batch_pasting_flag = clipboard_shared.batch_pasting.clone();
         let clear_selection_flag = clipboard_shared.clear_selection_requested.clone();
+        let needs_release = Arc::new(AtomicBool::new(false));
         let sync_dirty_flag = Arc::new(AtomicBool::new(false));
         let needs_model_refresh_flag = Arc::new(AtomicBool::new(false));
         let mut clipboard_service = ClipboardService::new(
@@ -89,6 +91,7 @@ impl AppController {
             app.clone(),
             sync_dirty_flag.clone(),
             needs_model_refresh_flag.clone(),
+            needs_release.clone(),
         );
         let clipboard_service_for_callbacks = clipboard_service.clone();
         // Load initial data and apply settings
@@ -124,6 +127,7 @@ impl AppController {
             frontend.clone(),
             app.clone(),
             foreground_app_name,
+            needs_release.clone(),
         ) {
             Ok(fs) => fs,
             Err(e) => {
@@ -175,6 +179,7 @@ impl AppController {
             copy_as_plain_text: copy_as_plain_text_flag,
             batch_pasting: batch_pasting_flag,
             clear_selection: clear_selection_flag,
+            needs_release: needs_release.clone(),
         };
 
         // Bind all Slint callbacks by category
@@ -287,6 +292,7 @@ impl AppController {
             if let Some(app) = ctx_close.app.upgrade() {
                 app.set_pinned(false);
             }
+            ctx_close.needs_release.store(true, Ordering::SeqCst);
             if let Ok(mut fe) = ctx_close.frontend.lock() {
                 fe.hide();
                 let mut s = ctx_close.settings.lock().expect("settings lock poisoned");

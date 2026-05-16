@@ -12,7 +12,7 @@ use crate::platform::file_icon;
 use crate::App;
 use crate::ClipboardEntry;
 use base64::Engine;
-use slint::{Image, Model, ModelRc, SharedString, VecModel};
+use slint::{ComponentHandle, Image, Model, ModelRc, SharedString, VecModel};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -35,6 +35,7 @@ pub struct ClipboardService {
     /// Cache of ClipboardEntry keyed by item id, with updated_at for invalidation.
     entry_cache: HashMap<i64, (String, ClipboardEntry)>,
     image_cache: ImageCache,
+    needs_release: Arc<AtomicBool>,
 }
 
 impl ClipboardService {
@@ -44,6 +45,7 @@ impl ClipboardService {
         app: slint::Weak<App>,
         sync_dirty: Arc<AtomicBool>,
         needs_model_refresh: Arc<AtomicBool>,
+        needs_release: Arc<AtomicBool>,
     ) -> Self {
         let model: Rc<VecModel<ClipboardEntry>> = Rc::new(VecModel::default());
         let service = Self {
@@ -61,6 +63,7 @@ impl ClipboardService {
             max_items: 100, // 历史默认值
             entry_cache: HashMap::new(),
             image_cache: ImageCache::new(30),
+            needs_release,
         };
         if let Some(app) = service.app.upgrade() {
             app.set_clipboard_items(ModelRc::from(model));
@@ -700,6 +703,36 @@ impl ClipboardService {
 
 impl Pollable for ClipboardService {
     fn poll(&mut self) {
+        // Release resources when window hides (set by close_window / auto-hide)
+        if self.needs_release.swap(false, Ordering::SeqCst) {
+            self.release_model_resources();
+        }
+
+        // Reload model if window is visible but model is empty
+        if let Some(app) = self.app.upgrade() {
+            if app.window().is_visible() && self.model.row_count() == 0 {
+                let order_by = if self.sort_by_created { "created_at" } else { "updated_at" };
+                let batch: usize = 80;
+                let limit = if self.max_items == 0 { batch } else { self.max_items.min(batch) };
+                let items = {
+                    if let Ok(db) = self.db.lock() {
+                        db.load_filtered_with_tags(&self.filters, limit, order_by)
+                            .unwrap_or_default()
+                    } else {
+                        vec![]
+                    }
+                };
+                for item in &items {
+                    let entry = self.get_or_create_entry(item);
+                    self.model.push(entry);
+                }
+                if let Some(app) = self.app.upgrade() {
+                    app.set_item_count(self.model.row_count() as i32);
+                }
+                return;
+            }
+        }
+
         // Check if batch paste completed and wants selection cleared
         if self.shared.clear_selection_requested.swap(false, Ordering::SeqCst) {
             self.clear_selection();
