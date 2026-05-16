@@ -694,10 +694,11 @@ impl ClipboardService {
         entry
     }
 
-    /// Release model + GPU textures. Called when window hides.
+    /// Release model, GPU textures, and entry cache. Called when window hides.
     pub fn release_model_resources(&mut self) {
         self.image_cache.clear();
         self.model.clear();
+        self.entry_cache.clear();
     }
 }
 
