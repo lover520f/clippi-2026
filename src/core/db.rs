@@ -13,6 +13,8 @@ impl Database {
         let conn = Connection::open(path)?;
         let db = Self { conn };
         db.init_schema()?;
+        // Limit SQLite page cache to 2 MB, keep temp tables in memory
+        db.conn.execute_batch("PRAGMA cache_size = -2000; PRAGMA temp_store = memory;")?;
         Ok(db)
     }
 
