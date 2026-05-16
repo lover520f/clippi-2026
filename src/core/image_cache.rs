@@ -3,6 +3,7 @@
 use slint::Image;
 use std::collections::{HashMap, VecDeque};
 
+#[derive(Clone)]
 pub struct ImageCache {
     images: HashMap<String, Image>,
     order: VecDeque<String>,
