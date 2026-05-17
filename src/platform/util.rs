@@ -23,6 +23,7 @@ pub fn hicon_to_base64_png(hicon: windows_sys::Win32::Foundation::HANDLE, size: 
         ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
         HDC, HGDIOBJ, HBRUSH,
     };
+    use windows_sys::Win32::UI::WindowsAndMessaging::DestroyIcon;
 
     extern "system" {
         fn DrawIconEx(
@@ -46,7 +47,7 @@ pub fn hicon_to_base64_png(hicon: windows_sys::Win32::Foundation::HANDLE, size: 
         ReleaseDC(std::ptr::null_mut(), screen_dc);
 
         if mem_dc.is_null() {
-            DeleteObject(hicon as HGDIOBJ);
+            DestroyIcon(hicon);
             return None;
         }
 
@@ -78,7 +79,7 @@ pub fn hicon_to_base64_png(hicon: windows_sys::Win32::Foundation::HANDLE, size: 
         );
         if dib.is_null() || pixels.is_null() {
             DeleteDC(mem_dc);
-            DeleteObject(hicon as HGDIOBJ);
+            DestroyIcon(hicon);
             return None;
         }
 
@@ -92,7 +93,7 @@ pub fn hicon_to_base64_png(hicon: windows_sys::Win32::Foundation::HANDLE, size: 
         SelectObject(mem_dc, old_bmp);
         DeleteObject(dib);
         DeleteDC(mem_dc);
-        DeleteObject(hicon as HGDIOBJ);
+        DestroyIcon(hicon);
 
         // BGRA → RGBA
         let mut rgba = Vec::with_capacity(pixel_count * 4);

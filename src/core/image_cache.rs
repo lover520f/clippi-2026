@@ -53,8 +53,4 @@ impl ImageCache {
         self.order.clear();
     }
 
-    /// Number of cached images.
-    pub fn len(&self) -> usize {
-        self.images.len()
-    }
 }
