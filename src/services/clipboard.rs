@@ -14,6 +14,7 @@ use base64::Engine;
 use lru::LruCache;
 use slint::{ComponentHandle, Image, Model, ModelNotify, ModelRc, ModelTracker, SharedString};
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -70,6 +71,7 @@ pub(crate) struct SlimEntry {
 pub struct LazyClipboardModel {
     entries: RefCell<Vec<SlimEntry>>,
     image_cache: RefCell<LruCache<String, Image>>,
+    output_cache: RefCell<HashMap<usize, ClipboardEntry>>,
     notify: ModelNotify,
 }
 
@@ -80,11 +82,13 @@ impl LazyClipboardModel {
             image_cache: RefCell::new(LruCache::new(
                 NonZeroUsize::new(cache_size.max(1)).unwrap(),
             )),
+            output_cache: RefCell::new(HashMap::new()),
             notify: ModelNotify::default(),
         })
     }
 
     pub fn push(&self, entry: SlimEntry) {
+        self.output_cache.borrow_mut().clear();
         let idx = {
             let mut entries = self.entries.borrow_mut();
             entries.push(entry);
@@ -94,16 +98,19 @@ impl LazyClipboardModel {
     }
 
     pub fn insert(&self, index: usize, entry: SlimEntry) {
+        self.output_cache.borrow_mut().clear();
         self.entries.borrow_mut().insert(index, entry);
         self.notify.row_added(index, 1);
     }
 
     pub fn remove(&self, index: usize) {
+        self.output_cache.borrow_mut().clear();
         self.entries.borrow_mut().remove(index);
         self.notify.row_removed(index, 1);
     }
 
     pub fn update_slim(&self, row: usize, entry: SlimEntry) {
+        self.output_cache.borrow_mut().remove(&row);
         if let Some(slot) = self.entries.borrow_mut().get_mut(row) {
             *slot = entry;
         }
@@ -115,6 +122,7 @@ impl LazyClipboardModel {
         if count > 0 {
             self.entries.borrow_mut().clear();
             self.image_cache.borrow_mut().clear();
+            self.output_cache.borrow_mut().clear();
             self.notify.row_removed(0, count);
         }
     }
@@ -134,12 +142,19 @@ impl Model for LazyClipboardModel {
     }
 
     fn row_data(&self, row: usize) -> Option<Self::Data> {
+        // Check output cache first — cheap SharedString refcount bump
+        if let Some(entry) = self.output_cache.borrow().get(&row) {
+            return Some(entry.clone());
+        }
         let slim = self.entries.borrow().get(row)?.clone();
         let mut cache = self.image_cache.borrow_mut();
-        Some(slim_to_entry(&slim, &mut cache))
+        let entry = slim_to_entry(&slim, &mut cache);
+        self.output_cache.borrow_mut().insert(row, entry.clone());
+        Some(entry)
     }
 
     fn set_row_data(&self, row: usize, data: Self::Data) {
+        self.output_cache.borrow_mut().remove(&row);
         let slim = entry_to_slim(&data);
         if let Some(slot) = self.entries.borrow_mut().get_mut(row) {
             *slot = slim;
@@ -989,9 +1004,15 @@ impl Pollable for ClipboardService {
                     if let Some(idx) = (0..self.model.row_count()).position(|i| {
                         self.model.row_slim(i).map(|e| e.id as i64 == id).unwrap_or(false)
                     }) {
-                        self.model.remove(idx);
+                        if idx == 0 {
+                            self.model.update_slim(0, entry);
+                        } else {
+                            self.model.remove(idx);
+                            self.model.insert(0, entry);
+                        }
+                    } else {
+                        self.model.insert(0, entry);
                     }
-                    self.model.insert(0, entry);
                 }
                 PollAction::InsertNew(item) => {
                     let entry = self.get_or_create_slim(&item);
@@ -1059,7 +1080,10 @@ fn generate_thumbnail(original_path: &str, max_dim: u32) -> Image {
     let new_h = (h as f64 * ratio) as u32;
     let resized = img.resize_exact(new_w, new_h, image::imageops::FilterType::Lanczos3);
     let thumb_path = thumbnail_path(original_path);
-    let _ = resized.save(&thumb_path);
+    if let Err(e) = resized.save(&thumb_path) {
+        eprintln!("[WARN] Failed to save thumbnail {}: {}", thumb_path, e);
+        return Image::default();
+    }
     Image::load_from_path(std::path::Path::new(&thumb_path)).unwrap_or_default()
 }
 
@@ -1313,7 +1337,7 @@ fn item_to_slim(item: &crate::core::types::ClipboardItem) -> SlimEntry {
 /// Convert SlimEntry to ClipboardEntry, loading images from the LRU cache on demand.
 /// This is called from `LazyClipboardModel::row_data()` when Slint renders visible rows.
 fn slim_to_entry(slim: &SlimEntry, cache: &mut LruCache<String, Image>) -> ClipboardEntry {
-    let thumbnail = load_lru_thumbnail(cache, &slim.image_path, 256);
+    let thumbnail = load_lru_thumbnail(cache, &slim.image_path, 128);
     let source_app_icon_image = load_lru_image(cache, &slim.source_app_icon_path);
     let file_icon_image = load_lru_image(cache, &slim.file_icon_path);
     let favicon_image = load_lru_image(cache, &slim.favicon_path);
