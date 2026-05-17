@@ -141,6 +141,7 @@ impl ClipboardService {
         for entry in entries {
             self.model.push(entry);
         }
+        self.prune_entry_cache();
         if let Some(app) = self.app.upgrade() {
             app.set_item_count(self.model.row_count() as i32);
             app.set_selected_count(0);
@@ -472,14 +473,7 @@ impl ClipboardService {
                 }
             }
         }
-        // Prune entry_cache when it grows too large
-        let max_cache = if self.max_items == 0 { 200 } else { self.max_items * 2 };
-        if self.entry_cache.len() > max_cache {
-            let model_ids: std::collections::HashSet<i64> = (0..self.model.row_count())
-                .filter_map(|i| self.model.row_data(i).map(|e| e.id as i64))
-                .collect();
-            self.entry_cache.retain(|&id, _| model_ids.contains(&id));
-        }
+        self.prune_entry_cache();
         if let Some(app) = self.app.upgrade() {
             app.set_item_count(self.model.row_count() as i32);
         }
@@ -665,14 +659,7 @@ impl ClipboardService {
         for i in indices {
             self.model.remove(i);
         }
-        // Prune entry_cache when it grows too large
-        let max_cache = if self.max_items == 0 { 200 } else { self.max_items * 2 };
-        if self.entry_cache.len() > max_cache {
-            let model_ids: std::collections::HashSet<i64> = (0..self.model.row_count())
-                .filter_map(|i| self.model.row_data(i).map(|e| e.id as i64))
-                .collect();
-            self.entry_cache.retain(|&id, _| model_ids.contains(&id));
-        }
+        self.prune_entry_cache();
         if let Some(app) = self.app.upgrade() {
             app.set_item_count(self.model.row_count() as i32);
             app.set_selected_count(0);
@@ -699,6 +686,17 @@ impl ClipboardService {
         self.image_cache.clear();
         self.model.clear();
         self.entry_cache.clear();
+    }
+
+    /// Prune entry_cache to only retain entries that are in the current model.
+    fn prune_entry_cache(&mut self) {
+        let max_cache = if self.max_items == 0 { 200 } else { self.max_items * 2 };
+        if self.entry_cache.len() > max_cache {
+            let model_ids: std::collections::HashSet<i64> = (0..self.model.row_count())
+                .filter_map(|i| self.model.row_data(i).map(|e| e.id as i64))
+                .collect();
+            self.entry_cache.retain(|&id, _| model_ids.contains(&id));
+        }
     }
 
     const LOAD_MORE_BATCH: usize = 40;
@@ -766,6 +764,31 @@ impl Pollable for ClipboardService {
                 }
                 return;
             }
+        }
+
+        // If window is hidden, skip model/cache work to avoid repopulating after release.
+        // Still do DB upserts to keep persistent state consistent.
+        let is_visible = self.app.upgrade()
+            .map(|a| a.window().is_visible())
+            .unwrap_or(false);
+        if !is_visible {
+            let pending = {
+                let mut p = self.shared.pending.lock().expect("clipboard pending lock poisoned");
+                p.drain(..).collect::<Vec<_>>()
+            };
+            if !pending.is_empty() {
+                if let Ok(db) = self.db.lock() {
+                    for mut item in pending {
+                        if self.copy_as_plain_text && item.content_type == crate::core::types::ContentType::RichText {
+                            item.content_type = crate::core::types::ContentType::PlainText;
+                            item.rich_data = String::new();
+                        }
+                        let _ = db.upsert(&item);
+                    }
+                }
+                self.mark_dirty();
+            }
+            return;
         }
 
         // Check if batch paste completed and wants selection cleared
@@ -863,6 +886,7 @@ impl Pollable for ClipboardService {
                 self.model.remove(self.model.row_count() - 1);
             }
         }
+        self.prune_entry_cache();
 
         if let Some(app) = self.app.upgrade() {
             app.set_item_count(self.model.row_count() as i32);
