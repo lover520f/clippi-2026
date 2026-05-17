@@ -11,18 +11,157 @@ use crate::platform::file_icon;
 use crate::App;
 use crate::ClipboardEntry;
 use base64::Engine;
-use slint::{ComponentHandle, Image, Model, ModelRc, SharedString, VecModel};
-use std::collections::HashMap;
+use lru::LruCache;
+use slint::{ComponentHandle, Image, Model, ModelNotify, ModelRc, ModelTracker, SharedString};
+use std::cell::RefCell;
+use std::num::NonZeroUsize;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
+
+// ── SlimEntry: lightweight entry with image paths (no decoded pixel buffers) ──
+
+#[derive(Clone)]
+pub(crate) struct SlimEntry {
+    id: i32,
+    preview: SharedString,
+    content_type: SharedString,
+    time_label: SharedString,
+    image_path: String,
+    preview_length: i32,
+    image_width: i32,
+    image_height: i32,
+    is_favorite: bool,
+    note: SharedString,
+    source_app_name: SharedString,
+    source_app_icon_path: String,
+    color_swatch: slint::Color,
+    selected: bool,
+    selection_order: i32,
+    // File fields
+    file_count: i32,
+    file_icon_text: SharedString,
+    file_name_1: SharedString,
+    file_name_2: SharedString,
+    file_name_3: SharedString,
+    file_overflow: i32,
+    file_icon_path: String,
+    // Link fields
+    link_domain: SharedString,
+    link_path: SharedString,
+    favicon_path: String,
+    folder_icon_path: String,
+    // Tag fields
+    has_tags: bool,
+    tag_dot_0: slint::Color,
+    tag_dot_1: slint::Color,
+    tag_dot_2: slint::Color,
+    tag_name_0: SharedString,
+    tag_name_1: SharedString,
+    tag_name_2: SharedString,
+    tags_overflow: i32,
+}
+
+// ── LazyClipboardModel: custom Slint Model with LRU image cache ──
+///
+/// Stores lightweight `SlimEntry` items and lazily loads `Image` pixel buffers
+/// when Slint's ListView calls `row_data()` for visible rows. An LRU cache
+/// evicts images that haven't been accessed recently, bounding GPU memory.
+pub struct LazyClipboardModel {
+    entries: RefCell<Vec<SlimEntry>>,
+    image_cache: RefCell<LruCache<String, Image>>,
+    notify: ModelNotify,
+}
+
+impl LazyClipboardModel {
+    pub fn new(cache_size: usize) -> Rc<Self> {
+        Rc::new(Self {
+            entries: RefCell::new(Vec::new()),
+            image_cache: RefCell::new(LruCache::new(
+                NonZeroUsize::new(cache_size.max(1)).unwrap(),
+            )),
+            notify: ModelNotify::default(),
+        })
+    }
+
+    pub fn push(&self, entry: SlimEntry) {
+        let idx = {
+            let mut entries = self.entries.borrow_mut();
+            entries.push(entry);
+            entries.len() - 1
+        };
+        self.notify.row_added(idx, 1);
+    }
+
+    pub fn insert(&self, index: usize, entry: SlimEntry) {
+        self.entries.borrow_mut().insert(index, entry);
+        self.notify.row_added(index, 1);
+    }
+
+    pub fn remove(&self, index: usize) {
+        self.entries.borrow_mut().remove(index);
+        self.notify.row_removed(index, 1);
+    }
+
+    pub fn update_slim(&self, row: usize, entry: SlimEntry) {
+        if let Some(slot) = self.entries.borrow_mut().get_mut(row) {
+            *slot = entry;
+        }
+        self.notify.row_changed(row);
+    }
+
+    pub fn clear(&self) {
+        let count = self.entries.borrow().len();
+        if count > 0 {
+            self.entries.borrow_mut().clear();
+            self.image_cache.borrow_mut().clear();
+            self.notify.row_removed(0, count);
+        }
+    }
+
+    /// Read a SlimEntry without loading images (cheap, for internal id/flag reads).
+    pub fn row_slim(&self, row: usize) -> Option<SlimEntry> {
+        self.entries.borrow().get(row).cloned()
+    }
+
+}
+
+impl Model for LazyClipboardModel {
+    type Data = ClipboardEntry;
+
+    fn row_count(&self) -> usize {
+        self.entries.borrow().len()
+    }
+
+    fn row_data(&self, row: usize) -> Option<Self::Data> {
+        let slim = self.entries.borrow().get(row)?.clone();
+        let mut cache = self.image_cache.borrow_mut();
+        Some(slim_to_entry(&slim, &mut cache))
+    }
+
+    fn set_row_data(&self, row: usize, data: Self::Data) {
+        let slim = entry_to_slim(&data);
+        if let Some(slot) = self.entries.borrow_mut().get_mut(row) {
+            *slot = slim;
+        }
+        self.notify.row_changed(row);
+    }
+
+    fn model_tracker(&self) -> &dyn ModelTracker {
+        &self.notify
+    }
+
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+}
 
 #[derive(Clone)]
 pub struct ClipboardService {
     shared: ClipboardShared,
     db: Arc<Mutex<Database>>,
     app: slint::Weak<App>,
-    model: Rc<VecModel<ClipboardEntry>>,
+    model: Rc<LazyClipboardModel>,
     sort_by_created: bool,
     copy_as_plain_text: bool,
     filters: ClipboardFilters,
@@ -31,8 +170,6 @@ pub struct ClipboardService {
     sync_dirty: Arc<AtomicBool>,
     needs_model_refresh: Arc<AtomicBool>,
     max_items: usize,
-    /// Cache of decoded Image objects keyed by file path to avoid duplicate pixel buffers.
-    icon_cache: HashMap<String, Image>,
     needs_release: Arc<AtomicBool>,
 }
 
@@ -45,7 +182,7 @@ impl ClipboardService {
         needs_model_refresh: Arc<AtomicBool>,
         needs_release: Arc<AtomicBool>,
     ) -> Self {
-        let model: Rc<VecModel<ClipboardEntry>> = Rc::new(VecModel::default());
+        let model = LazyClipboardModel::new(100);
         let service = Self {
             shared,
             db,
@@ -59,7 +196,6 @@ impl ClipboardService {
             sync_dirty,
             needs_model_refresh,
             max_items: 100, // 历史默认值
-            icon_cache: HashMap::new(),
             needs_release,
         };
         if let Some(app) = service.app.upgrade() {
@@ -132,8 +268,8 @@ impl ClipboardService {
         let items = self.db.lock().expect("db lock poisoned")
             .load_filtered_with_tags(&self.filters, limit, order_by)
             .unwrap_or_default();
-        let entries: Vec<ClipboardEntry> = items.iter()
-            .map(|item| self.get_or_create_entry(item))
+        let entries: Vec<SlimEntry> = items.iter()
+            .map(|item| self.get_or_create_slim(item))
             .collect();
         for entry in entries {
             self.model.push(entry);
@@ -175,11 +311,11 @@ impl ClipboardService {
             }
         };
         if let Some(item) = item {
-            let entry = self.get_or_create_entry(&item);
+            let entry = self.get_or_create_slim(&item);
             for i in 0..self.model.row_count() {
-                if let Some(e) = self.model.row_data(i) {
+                if let Some(e) = self.model.row_slim(i) {
                     if e.id == id {
-                        self.model.set_row_data(i, entry);
+                        self.model.update_slim(i, entry);
                         break;
                     }
                 }
@@ -461,7 +597,7 @@ impl ClipboardService {
         }
         self.mark_dirty();
         for i in 0..self.model.row_count() {
-            if let Some(entry) = self.model.row_data(i) {
+            if let Some(entry) = self.model.row_slim(i) {
                 if entry.id == id {
                     self.model.remove(i);
                     break;
@@ -535,7 +671,7 @@ impl ClipboardService {
         let mut anchor_idx: Option<usize> = None;
         let mut clicked_idx: Option<usize> = None;
         for i in 0..self.model.row_count() {
-            if let Some(entry) = self.model.row_data(i) {
+            if let Some(entry) = self.model.row_slim(i) {
                 if entry.id == self.anchor_id {
                     anchor_idx = Some(i);
                 }
@@ -550,13 +686,13 @@ impl ClipboardService {
             self.selected_ids.clear();
             if a <= c {
                 for i in a..=c {
-                    if let Some(entry) = self.model.row_data(i) {
+                    if let Some(entry) = self.model.row_slim(i) {
                         self.selected_ids.push(entry.id);
                     }
                 }
             } else {
                 for i in (c..=a).rev() {
-                    if let Some(entry) = self.model.row_data(i) {
+                    if let Some(entry) = self.model.row_slim(i) {
                         self.selected_ids.push(entry.id);
                     }
                 }
@@ -584,12 +720,12 @@ impl ClipboardService {
         let changed: Vec<i32> = prev_set.symmetric_difference(&new_set).copied().collect();
         if changed.is_empty() { return; }
         for i in 0..self.model.row_count() {
-            if let Some(mut entry) = self.model.row_data(i) {
+            if let Some(mut entry) = self.model.row_slim(i) {
                 if changed.contains(&entry.id) {
                     let pos = self.selected_ids.iter().position(|&x| x == entry.id);
                     entry.selected = pos.is_some();
                     entry.selection_order = pos.map(|p| p as i32).unwrap_or(-1);
-                    self.model.set_row_data(i, entry);
+                    self.model.update_slim(i, entry);
                 }
             }
         }
@@ -652,7 +788,7 @@ impl ClipboardService {
         self.selected_ids.clear();
         self.anchor_id = -1;
         let mut indices: Vec<usize> = (0..self.model.row_count())
-            .filter(|&i| self.model.row_data(i).is_some_and(|e| ids.contains(&e.id)))
+            .filter(|&i| self.model.row_slim(i).is_some_and(|e| ids.contains(&e.id)))
             .collect();
         indices.sort_unstable_by(|a, b| b.cmp(a));
         for i in indices {
@@ -665,14 +801,14 @@ impl ClipboardService {
     }
 
     /// Build a ClipboardEntry from a ClipboardItem, using the shared icon cache.
-    fn get_or_create_entry(&mut self, item: &crate::core::types::ClipboardItem) -> ClipboardEntry {
-        item_to_entry(item, &mut self.icon_cache)
+    fn get_or_create_slim(&self, item: &crate::core::types::ClipboardItem) -> SlimEntry {
+        item_to_slim(item)
     }
 
-    /// Release model, GPU textures, and entry cache. Called when window hides.
-    /// Replaces the VecModel entirely so Slint drops the old allocation.
+    /// Release model, image cache, and GPU textures. Called when window hides.
+    /// Replaces the LazyClipboardModel entirely so Slint drops the old allocation.
     pub fn release_model_resources(&mut self) {
-        let new_model: Rc<VecModel<ClipboardEntry>> = Rc::new(VecModel::default());
+        let new_model = LazyClipboardModel::new(100);
         let old_model = std::mem::replace(&mut self.model, new_model);
         // Ensure Slint UI binds to the new (empty) model so the old one can be freed.
         if let Some(app) = self.app.upgrade() {
@@ -680,7 +816,6 @@ impl ClipboardService {
             app.set_item_count(0);
         }
         drop(old_model);
-        self.icon_cache.clear();
     }
 
     const LOAD_MORE_BATCH: usize = 20;
@@ -709,7 +844,7 @@ impl ClipboardService {
             return;
         }
         for item in &items[current..] {
-            let entry = self.get_or_create_entry(item);
+            let entry = self.get_or_create_slim(item);
             self.model.push(entry);
         }
         if let Some(app) = self.app.upgrade() {
@@ -740,7 +875,7 @@ impl Pollable for ClipboardService {
                     }
                 };
                 for item in &items {
-                    let entry = self.get_or_create_entry(item);
+                    let entry = self.get_or_create_slim(item);
                     self.model.push(entry);
                 }
                 if let Some(app) = self.app.upgrade() {
@@ -842,24 +977,24 @@ impl Pollable for ClipboardService {
         for action in actions {
             match action {
                 PollAction::UpdateExisting(id, existing) => {
-                    let entry = self.get_or_create_entry(&existing);
+                    let entry = self.get_or_create_slim(&existing);
                     if let Some(idx) = (0..self.model.row_count()).position(|i| {
-                        self.model.row_data(i).map(|e| e.id as i64 == id).unwrap_or(false)
+                        self.model.row_slim(i).map(|e| e.id as i64 == id).unwrap_or(false)
                     }) {
-                        self.model.set_row_data(idx, entry);
+                        self.model.update_slim(idx, entry);
                     }
                 }
                 PollAction::MoveToTop(id, existing) => {
-                    let entry = self.get_or_create_entry(&existing);
+                    let entry = self.get_or_create_slim(&existing);
                     if let Some(idx) = (0..self.model.row_count()).position(|i| {
-                        self.model.row_data(i).map(|e| e.id as i64 == id).unwrap_or(false)
+                        self.model.row_slim(i).map(|e| e.id as i64 == id).unwrap_or(false)
                     }) {
                         self.model.remove(idx);
                     }
                     self.model.insert(0, entry);
                 }
                 PollAction::InsertNew(item) => {
-                    let entry = self.get_or_create_entry(&item);
+                    let entry = self.get_or_create_slim(&item);
                     self.model.insert(0, entry);
                 }
             }
@@ -877,35 +1012,78 @@ impl Pollable for ClipboardService {
     }
 }
 
-/// Load a thumbnail image, auto-downsizing to max_dim pixels (longest side).
-/// This keeps GPU texture memory bounded for large clipboard images like screenshots.
-fn load_thumbnail_resized(path: &str, max_dim: u32) -> Image {
+// ── Lazy image loading with LRU cache ──
+
+/// Load an Image from disk, caching in the LRU cache so visible items share pixel buffers.
+fn load_lru_image(cache: &mut LruCache<String, Image>, path: &str) -> Image {
     if path.is_empty() {
         return Image::default();
     }
-    // Check for a cached thumbnail first.
-    let thumb_path = {
-        let p = std::path::Path::new(path);
-        let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("thumb");
-        let parent = p.parent().unwrap_or(std::path::Path::new("."));
-        parent.join(format!("{}_thumb.png", stem))
-    };
-    if thumb_path.exists() {
-        return Image::load_from_path(&thumb_path).unwrap_or_default();
+    if let Some(img) = cache.get(path) {
+        return img.clone();
     }
-    let Some(img) = image::ImageReader::open(path).ok().and_then(|r| r.decode().ok()) else {
+    let img = Image::load_from_path(std::path::Path::new(path)).unwrap_or_default();
+    cache.put(path.to_string(), img.clone());
+    img
+}
+
+/// Compute the thumbnail file path for a given image path.
+fn thumbnail_path(image_path: &str) -> String {
+    let p = std::path::Path::new(image_path);
+    let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("thumb");
+    let parent = p.parent().unwrap_or(std::path::Path::new("."));
+    parent.join(format!("{}_thumb.png", stem))
+        .to_string_lossy()
+        .to_string()
+}
+
+/// Generate a thumbnail from an image file, caching the result on disk.
+///
+/// Decodes the image via the `image` crate, resizes to at most `max_dim` pixels
+/// on the longest side, saves the result as a PNG alongside the original, and
+/// loads it as a Slint `Image`. Only called once per visible thumbnail — the
+/// LRU cache in `LazyClipboardModel` handles in-memory caching.
+fn generate_thumbnail(original_path: &str, max_dim: u32) -> Image {
+    let Some(img) = image::ImageReader::open(original_path)
+        .ok()
+        .and_then(|r| r.decode().ok())
+    else {
         return Image::default();
     };
     let (w, h) = (img.width(), img.height());
     if w <= max_dim && h <= max_dim {
-        return Image::load_from_path(std::path::Path::new(path)).unwrap_or_default();
+        return Image::load_from_path(std::path::Path::new(original_path)).unwrap_or_default();
     }
     let ratio = max_dim as f64 / u32::max(w, h) as f64;
     let new_w = (w as f64 * ratio) as u32;
     let new_h = (h as f64 * ratio) as u32;
     let resized = img.resize_exact(new_w, new_h, image::imageops::FilterType::Lanczos3);
+    let thumb_path = thumbnail_path(original_path);
     let _ = resized.save(&thumb_path);
-    Image::load_from_path(&thumb_path).unwrap_or_default()
+    Image::load_from_path(std::path::Path::new(&thumb_path)).unwrap_or_default()
+}
+
+/// Load a thumbnail image via LRU cache, generating it on first access.
+fn load_lru_thumbnail(cache: &mut LruCache<String, Image>, original_path: &str, max_dim: u32) -> Image {
+    if original_path.is_empty() {
+        return Image::default();
+    }
+    let thumb_path = thumbnail_path(original_path);
+    // Check if already cached in LRU
+    if let Some(img) = cache.get(&thumb_path) {
+        return img.clone();
+    }
+    // Check if cached thumbnail file exists on disk
+    let tp = std::path::Path::new(&thumb_path);
+    if tp.exists() {
+        let img = Image::load_from_path(tp).unwrap_or_default();
+        cache.put(thumb_path, img.clone());
+        return img;
+    }
+    // Generate thumbnail
+    let img = generate_thumbnail(original_path, max_dim);
+    cache.put(thumb_path, img.clone());
+    img
 }
 
 /// Convert hex color "#EF4444" to slint::Color
@@ -915,27 +1093,12 @@ fn hex_to_slint_color(hex: &str) -> slint::Color {
         .unwrap_or_default()
 }
 
-/// Load an Image from disk, caching by path so identical files share the same pixel buffer.
-/// Slint Image is internally reference-counted, so clone() only increments the ref count.
-fn load_cached_icon(cache: &mut HashMap<String, Image>, path: &str) -> Image {
-    if path.is_empty() {
-        return Image::default();
-    }
-    if let Some(img) = cache.get(path) {
-        return img.clone();
-    }
-    let img = match Image::load_from_path(std::path::Path::new(path)) {
-        Ok(img) => img,
-        Err(_) => return Image::default(),
-    };
-    cache.insert(path.to_string(), img.clone());
-    img
-}
+// ── Path computation helpers (no image loading) ──
 
-/// Compute source app icon path, cache PNG on disk, and load as Image.
-fn build_source_icon(item: &crate::core::types::ClipboardItem, cache: &mut HashMap<String, Image>) -> (String, Image) {
+/// Compute source app icon path, save PNG to disk, return path string.
+fn compute_source_icon_path(item: &crate::core::types::ClipboardItem) -> String {
     if item.source_app_icon.is_empty() {
-        return (String::new(), Image::default());
+        return String::new();
     }
     let icon_dir = images_dir().join("icons");
     let _ = std::fs::create_dir_all(&icon_dir);
@@ -948,14 +1111,12 @@ fn build_source_icon(item: &crate::core::types::ClipboardItem, cache: &mut HashM
     } else {
         icon_dir.join(format!("{}.png", safe_name))
     };
-    let path_str = icon_path.to_string_lossy().to_string();
     if !icon_path.exists() {
         if let Ok(png_bytes) = base64::engine::general_purpose::STANDARD.decode(&item.source_app_icon) {
             let _ = std::fs::write(&icon_path, png_bytes);
         }
     }
-    let img = load_cached_icon(cache, &path_str);
-    (path_str, img)
+    icon_path.to_string_lossy().to_string()
 }
 
 /// Build file type display fields: count, icon text, up to 3 filenames, overflow.
@@ -981,15 +1142,15 @@ fn build_file_fields(item: &crate::core::types::ClipboardItem) -> (i32, String, 
     (count, icon_text, n1, n2, n3, overflow)
 }
 
-/// Extract and cache OS file icon, returning path and loaded Image.
-fn build_file_icon(item: &crate::core::types::ClipboardItem, cache: &mut HashMap<String, Image>) -> (String, Image) {
+/// Compute OS file icon path, save PNG to disk, return path string.
+fn compute_file_icon_path(item: &crate::core::types::ClipboardItem) -> String {
     if item.content_type != crate::core::types::ContentType::File || item.file_data.is_empty() {
-        return (String::new(), Image::default());
+        return String::new();
     }
     let fd = crate::core::types::FileData::from_json(&item.file_data);
     let first_file = match fd.files.first() {
         Some(f) => f,
-        None => return (String::new(), Image::default()),
+        None => return String::new(),
     };
     let cache_name = if first_file.is_dir {
         "ext_folder".to_string()
@@ -1014,37 +1175,32 @@ fn build_file_icon(item: &crate::core::types::ClipboardItem, cache: &mut HashMap
     };
     let icon_base64 = match file_icon::extract_file_icon_base64(&first_file.path) {
         Some(b64) => b64,
-        None => return (String::new(), Image::default()),
+        None => return String::new(),
     };
     let icon_dir = images_dir().join("icons");
     let _ = std::fs::create_dir_all(&icon_dir);
     let icon_path = icon_dir.join(format!("{}.png", cache_name));
-    let path_str = icon_path.to_string_lossy().to_string();
     if !icon_path.exists() {
         if let Ok(png_bytes) = base64::engine::general_purpose::STANDARD.decode(&icon_base64) {
             let _ = std::fs::write(&icon_path, png_bytes);
         }
     }
-    let img = load_cached_icon(cache, &path_str);
-    (path_str, img)
+    icon_path.to_string_lossy().to_string()
 }
 
-/// Compute link/path preview paths and images.
-fn build_link_preview(item: &crate::core::types::ClipboardItem, cache: &mut HashMap<String, Image>) -> (SharedString, SharedString, SharedString, Image, SharedString, Image) {
+/// Compute link/path preview paths (no image loading).
+fn compute_link_preview_paths(item: &crate::core::types::ClipboardItem) -> (String, String, String, String) {
     match item.content_type {
         crate::core::types::ContentType::Link => {
             let domain = crate::core::types::url_domain(&item.full_text);
             let path = crate::core::types::url_path(&item.full_text);
             let cache_path = favicon::favicon_cache_path(&domain);
-            let cp = std::path::PathBuf::from(&cache_path);
-            let (fav_path_str, fav_img) = if cp.exists() {
-                let img = load_cached_icon(cache, &cache_path);
-                (cache_path, img)
+            let fav_path = if std::path::Path::new(&cache_path).exists() {
+                cache_path
             } else {
-                (String::new(), Image::default())
+                String::new()
             };
-            (SharedString::from(domain), SharedString::from(path),
-             SharedString::from(fav_path_str), fav_img, SharedString::default(), Image::default())
+            (domain, path, fav_path, String::new())
         }
         crate::core::types::ContentType::Path => {
             let icon_dir = images_dir().join("icons");
@@ -1061,18 +1217,14 @@ fn build_link_preview(item: &crate::core::types::ClipboardItem, cache: &mut Hash
                     }
                 }
             }
-            let path_str = icon_path.to_string_lossy().to_string();
-            let (fol_path_str, fol_img) = if icon_path.exists() {
-                let img = load_cached_icon(cache, &path_str);
-                (path_str, img)
+            let fol_path = if icon_path.exists() {
+                icon_path.to_string_lossy().to_string()
             } else {
-                (String::new(), Image::default())
+                String::new()
             };
-            (SharedString::default(), SharedString::default(),
-             SharedString::default(), Image::default(), SharedString::from(fol_path_str), fol_img)
+            (String::new(), String::new(), String::new(), fol_path)
         }
-        _ => (SharedString::default(), SharedString::default(),
-              SharedString::default(), Image::default(), SharedString::default(), Image::default())
+        _ => (String::new(), String::new(), String::new(), String::new())
     }
 }
 
@@ -1094,20 +1246,21 @@ fn build_tag_dots(tags: &[crate::core::types::TagInfo]) -> (bool, slint::Color, 
     (!tags.is_empty(), colors[0], colors[1], colors[2], names.remove(0), names.remove(0), names.remove(0), overflow)
 }
 
-fn item_to_entry(item: &crate::core::types::ClipboardItem, icon_cache: &mut HashMap<String, Image>) -> ClipboardEntry {
-    // Load thumbnail (auto-resized to 512px max to bound GPU memory).
-    let (thumbnail, img_w, img_h) = if !item.image_path.is_empty() {
-        let img = load_thumbnail_resized(&item.image_path, 512);
-        let (w, h) = image::image_dimensions(&item.image_path).unwrap_or((0, 0));
-        (img, w, h)
+// ── Conversion between SlimEntry and ClipboardEntry ──
+
+/// Build a lightweight SlimEntry from a ClipboardItem (computes paths, does NOT load images).
+fn item_to_slim(item: &crate::core::types::ClipboardItem) -> SlimEntry {
+    // Image dimensions (cheap — just reads file header)
+    let (img_w, img_h) = if !item.image_path.is_empty() {
+        image::image_dimensions(&item.image_path).unwrap_or((0, 0))
     } else {
-        (Image::default(), 0, 0)
+        (0, 0)
     };
 
-    let (source_icon_path, source_app_icon_image) = build_source_icon(item, icon_cache);
+    let source_app_icon_path = compute_source_icon_path(item);
     let (file_count, file_icon_text, file_name_1, file_name_2, file_name_3, file_overflow) = build_file_fields(item);
-    let (file_icon_path, file_icon_image) = build_file_icon(item, icon_cache);
-    let (link_domain, link_path, favicon_path, favicon_image, folder_icon_path, folder_icon_image) = build_link_preview(item, icon_cache);
+    let file_icon_path = compute_file_icon_path(item);
+    let (link_domain, link_path, favicon_path, folder_icon_path) = compute_link_preview_paths(item);
 
     let color_swatch = if item.content_type == crate::core::types::ContentType::Color {
         crate::core::color::detect_color(&item.full_text)
@@ -1119,28 +1272,20 @@ fn item_to_entry(item: &crate::core::types::ClipboardItem, icon_cache: &mut Hash
 
     let (has_tags, tag_dot_0, tag_dot_1, tag_dot_2, tag_name_0, tag_name_1, tag_name_2, tags_overflow) = build_tag_dots(&item.tags);
 
-    ClipboardEntry {
+    SlimEntry {
         id: item.id as i32,
         preview: SharedString::from(item.full_text.chars().take(500).collect::<String>()),
         content_type: SharedString::from(item.content_type.as_str()),
         time_label: SharedString::from(format_relative_time(&item.updated_at)),
-        image_path: SharedString::from(item.image_path.clone()),
-        thumbnail,
+        image_path: item.image_path.clone(),
         preview_length: item.full_text.len() as i32,
         image_width: img_w as i32,
         image_height: img_h as i32,
         is_favorite: item.is_favorite,
         note: SharedString::from(item.note.clone()),
         source_app_name: SharedString::from(item.source_app_name.clone()),
-        source_app_icon_path: SharedString::from(source_icon_path),
-        source_app_icon_image,
+        source_app_icon_path,
         color_swatch,
-        link_domain,
-        link_path,
-        favicon_path,
-        favicon_image,
-        folder_icon_path,
-        folder_icon_image,
         selected: false,
         selection_order: -1,
         file_count,
@@ -1149,8 +1294,11 @@ fn item_to_entry(item: &crate::core::types::ClipboardItem, icon_cache: &mut Hash
         file_name_2: SharedString::from(file_name_2),
         file_name_3: SharedString::from(file_name_3),
         file_overflow,
-        file_icon_path: SharedString::from(file_icon_path),
-        file_icon_image,
+        file_icon_path,
+        link_domain: SharedString::from(link_domain),
+        link_path: SharedString::from(link_path),
+        favicon_path,
+        folder_icon_path,
         has_tags,
         tag_dot_0,
         tag_dot_1,
@@ -1159,5 +1307,98 @@ fn item_to_entry(item: &crate::core::types::ClipboardItem, icon_cache: &mut Hash
         tag_name_1,
         tag_name_2,
         tags_overflow,
+    }
+}
+
+/// Convert SlimEntry to ClipboardEntry, loading images from the LRU cache on demand.
+/// This is called from `LazyClipboardModel::row_data()` when Slint renders visible rows.
+fn slim_to_entry(slim: &SlimEntry, cache: &mut LruCache<String, Image>) -> ClipboardEntry {
+    let thumbnail = load_lru_thumbnail(cache, &slim.image_path, 256);
+    let source_app_icon_image = load_lru_image(cache, &slim.source_app_icon_path);
+    let file_icon_image = load_lru_image(cache, &slim.file_icon_path);
+    let favicon_image = load_lru_image(cache, &slim.favicon_path);
+    let folder_icon_image = load_lru_image(cache, &slim.folder_icon_path);
+
+    ClipboardEntry {
+        id: slim.id,
+        preview: slim.preview.clone(),
+        content_type: slim.content_type.clone(),
+        time_label: slim.time_label.clone(),
+        image_path: SharedString::from(&slim.image_path),
+        thumbnail,
+        preview_length: slim.preview_length,
+        image_width: slim.image_width,
+        image_height: slim.image_height,
+        is_favorite: slim.is_favorite,
+        note: slim.note.clone(),
+        source_app_name: slim.source_app_name.clone(),
+        source_app_icon_path: SharedString::from(&slim.source_app_icon_path),
+        source_app_icon_image,
+        color_swatch: slim.color_swatch,
+        selected: slim.selected,
+        selection_order: slim.selection_order,
+        file_count: slim.file_count,
+        file_icon_text: slim.file_icon_text.clone(),
+        file_name_1: slim.file_name_1.clone(),
+        file_name_2: slim.file_name_2.clone(),
+        file_name_3: slim.file_name_3.clone(),
+        file_overflow: slim.file_overflow,
+        file_icon_path: SharedString::from(&slim.file_icon_path),
+        file_icon_image,
+        link_domain: slim.link_domain.clone(),
+        link_path: slim.link_path.clone(),
+        favicon_path: SharedString::from(&slim.favicon_path),
+        favicon_image,
+        folder_icon_path: SharedString::from(&slim.folder_icon_path),
+        folder_icon_image,
+        has_tags: slim.has_tags,
+        tag_dot_0: slim.tag_dot_0,
+        tag_dot_1: slim.tag_dot_1,
+        tag_dot_2: slim.tag_dot_2,
+        tag_name_0: slim.tag_name_0.clone(),
+        tag_name_1: slim.tag_name_1.clone(),
+        tag_name_2: slim.tag_name_2.clone(),
+        tags_overflow: slim.tags_overflow,
+    }
+}
+
+/// Convert a ClipboardEntry back to SlimEntry (extracts paths, discards image pixel buffers).
+/// Used by `LazyClipboardModel::set_row_data()` for the `Model` trait.
+fn entry_to_slim(entry: &ClipboardEntry) -> SlimEntry {
+    SlimEntry {
+        id: entry.id,
+        preview: entry.preview.clone(),
+        content_type: entry.content_type.clone(),
+        time_label: entry.time_label.clone(),
+        image_path: entry.image_path.to_string(),
+        preview_length: entry.preview_length,
+        image_width: entry.image_width,
+        image_height: entry.image_height,
+        is_favorite: entry.is_favorite,
+        note: entry.note.clone(),
+        source_app_name: entry.source_app_name.clone(),
+        source_app_icon_path: entry.source_app_icon_path.to_string(),
+        color_swatch: entry.color_swatch,
+        selected: entry.selected,
+        selection_order: entry.selection_order,
+        file_count: entry.file_count,
+        file_icon_text: entry.file_icon_text.clone(),
+        file_name_1: entry.file_name_1.clone(),
+        file_name_2: entry.file_name_2.clone(),
+        file_name_3: entry.file_name_3.clone(),
+        file_overflow: entry.file_overflow,
+        file_icon_path: entry.file_icon_path.to_string(),
+        link_domain: entry.link_domain.clone(),
+        link_path: entry.link_path.clone(),
+        favicon_path: entry.favicon_path.to_string(),
+        folder_icon_path: entry.folder_icon_path.to_string(),
+        has_tags: entry.has_tags,
+        tag_dot_0: entry.tag_dot_0,
+        tag_dot_1: entry.tag_dot_1,
+        tag_dot_2: entry.tag_dot_2,
+        tag_name_0: entry.tag_name_0.clone(),
+        tag_name_1: entry.tag_name_1.clone(),
+        tag_name_2: entry.tag_name_2.clone(),
+        tags_overflow: entry.tags_overflow,
     }
 }
