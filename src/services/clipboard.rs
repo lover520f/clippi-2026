@@ -1,7 +1,6 @@
 //! Clipboard service - handles clipboard business logic
 
 use crate::core::db::Database;
-use crate::core::image_cache::ImageCache;
 use crate::core::filters::ClipboardFilters;
 use crate::core::paths::images_dir;
 use crate::core::types::format_relative_time;
@@ -34,7 +33,6 @@ pub struct ClipboardService {
     max_items: usize,
     /// Cache of ClipboardEntry keyed by item id, with updated_at for invalidation.
     entry_cache: HashMap<i64, (String, ClipboardEntry)>,
-    image_cache: ImageCache,
     needs_release: Arc<AtomicBool>,
 }
 
@@ -62,7 +60,6 @@ impl ClipboardService {
             needs_model_refresh,
             max_items: 100, // 历史默认值
             entry_cache: HashMap::new(),
-            image_cache: ImageCache::new(30),
             needs_release,
         };
         if let Some(app) = service.app.upgrade() {
@@ -676,15 +673,22 @@ impl ClipboardService {
                 return cached_entry.clone();
             }
         }
-        let entry = item_to_entry(item, &mut self.image_cache);
+        let entry = item_to_entry(item);
         self.entry_cache.insert(item.id, (ts_key, entry.clone()));
         entry
     }
 
     /// Release model, GPU textures, and entry cache. Called when window hides.
+    /// Replaces the VecModel entirely so Slint drops the old allocation.
     pub fn release_model_resources(&mut self) {
-        self.image_cache.clear();
-        self.model.clear();
+        let new_model: Rc<VecModel<ClipboardEntry>> = Rc::new(VecModel::default());
+        let old_model = std::mem::replace(&mut self.model, new_model);
+        // Ensure Slint UI binds to the new (empty) model so the old one can be freed.
+        if let Some(app) = self.app.upgrade() {
+            app.set_clipboard_items(ModelRc::from(self.model.clone()));
+            app.set_item_count(0);
+        }
+        drop(old_model);
         self.entry_cache.clear();
     }
 
@@ -699,7 +703,7 @@ impl ClipboardService {
         }
     }
 
-    const LOAD_MORE_BATCH: usize = 40;
+    const LOAD_MORE_BATCH: usize = 20;
 
     /// Load more items into the model (called when user scrolls near bottom).
     pub fn load_more_items(&mut self) {
@@ -745,7 +749,7 @@ impl Pollable for ClipboardService {
         if let Some(app) = self.app.upgrade() {
             if app.window().is_visible() && self.model.row_count() == 0 {
                 let order_by = if self.sort_by_created { "created_at" } else { "updated_at" };
-                let batch: usize = 80;
+                let batch: usize = 20;
                 let limit = if self.max_items == 0 { batch } else { self.max_items.min(batch) };
                 let items = {
                     if let Ok(db) = self.db.lock() {
@@ -894,6 +898,37 @@ impl Pollable for ClipboardService {
     }
 }
 
+/// Load a thumbnail image, auto-downsizing to max_dim pixels (longest side).
+/// This keeps GPU texture memory bounded for large clipboard images like screenshots.
+fn load_thumbnail_resized(path: &str, max_dim: u32) -> Image {
+    if path.is_empty() {
+        return Image::default();
+    }
+    // Check for a cached thumbnail first.
+    let thumb_path = {
+        let p = std::path::Path::new(path);
+        let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("thumb");
+        let parent = p.parent().unwrap_or(std::path::Path::new("."));
+        parent.join(format!("{}_thumb.png", stem))
+    };
+    if thumb_path.exists() {
+        return Image::load_from_path(&thumb_path).unwrap_or_default();
+    }
+    let Some(img) = image::ImageReader::open(path).ok().and_then(|r| r.decode().ok()) else {
+        return Image::default();
+    };
+    let (w, h) = (img.width(), img.height());
+    if w <= max_dim && h <= max_dim {
+        return Image::load_from_path(std::path::Path::new(path)).unwrap_or_default();
+    }
+    let ratio = max_dim as f64 / u32::max(w, h) as f64;
+    let new_w = (w as f64 * ratio) as u32;
+    let new_h = (h as f64 * ratio) as u32;
+    let resized = img.resize_exact(new_w, new_h, image::imageops::FilterType::Lanczos3);
+    let _ = resized.save(&thumb_path);
+    Image::load_from_path(&thumb_path).unwrap_or_default()
+}
+
 /// Convert hex color "#EF4444" to slint::Color
 fn hex_to_slint_color(hex: &str) -> slint::Color {
     crate::core::types::parse_hex_color(hex)
@@ -901,10 +936,10 @@ fn hex_to_slint_color(hex: &str) -> slint::Color {
         .unwrap_or_default()
 }
 
-/// Decode source app icon from base64 and cache on disk as PNG.
-fn build_source_icon(item: &crate::core::types::ClipboardItem, image_cache: &mut ImageCache) -> (String, Image) {
+/// Compute source app icon path and cache PNG on disk (path only, no GPU load).
+fn build_source_icon_path(item: &crate::core::types::ClipboardItem) -> String {
     if item.source_app_icon.is_empty() {
-        return (String::new(), Image::default());
+        return String::new();
     }
     let icon_dir = images_dir().join("icons");
     let _ = std::fs::create_dir_all(&icon_dir);
@@ -923,8 +958,7 @@ fn build_source_icon(item: &crate::core::types::ClipboardItem, image_cache: &mut
             let _ = std::fs::write(&icon_path, png_bytes);
         }
     }
-    let img = image_cache.get_or_load(&path_str);
-    (path_str, img)
+    path_str
 }
 
 /// Build file type display fields: count, icon text, up to 3 filenames, overflow.
@@ -950,15 +984,15 @@ fn build_file_fields(item: &crate::core::types::ClipboardItem) -> (i32, String, 
     (count, icon_text, n1, n2, n3, overflow)
 }
 
-/// Extract and cache OS file icon for the first file in a file-type item.
-fn build_file_icon(item: &crate::core::types::ClipboardItem, image_cache: &mut ImageCache) -> (String, Image) {
+/// Extract and cache OS file icon path (path only, no GPU load).
+fn build_file_icon_path(item: &crate::core::types::ClipboardItem) -> String {
     if item.content_type != crate::core::types::ContentType::File || item.file_data.is_empty() {
-        return (String::new(), Image::default());
+        return String::new();
     }
     let fd = crate::core::types::FileData::from_json(&item.file_data);
     let first_file = match fd.files.first() {
         Some(f) => f,
-        None => return (String::new(), Image::default()),
+        None => return String::new(),
     };
     let cache_name = if first_file.is_dir {
         "ext_folder".to_string()
@@ -983,7 +1017,7 @@ fn build_file_icon(item: &crate::core::types::ClipboardItem, image_cache: &mut I
     };
     let icon_base64 = match file_icon::extract_file_icon_base64(&first_file.path) {
         Some(b64) => b64,
-        None => return (String::new(), Image::default()),
+        None => return String::new(),
     };
     let icon_dir = images_dir().join("icons");
     let _ = std::fs::create_dir_all(&icon_dir);
@@ -994,27 +1028,20 @@ fn build_file_icon(item: &crate::core::types::ClipboardItem, image_cache: &mut I
             let _ = std::fs::write(&icon_path, png_bytes);
         }
     }
-    let img = image_cache.get_or_load(&path_str);
-    (path_str, img)
+    path_str
 }
 
-/// Build link/path preview fields: domain, path, favicon, folder icon.
-fn build_link_preview(item: &crate::core::types::ClipboardItem, image_cache: &mut ImageCache) -> (SharedString, SharedString, SharedString, Image, SharedString, Image) {
+/// Compute link/path preview paths (path only, no GPU load).
+fn build_link_preview_paths(item: &crate::core::types::ClipboardItem) -> (SharedString, SharedString, SharedString, SharedString) {
     match item.content_type {
         crate::core::types::ContentType::Link => {
             let domain = crate::core::types::url_domain(&item.full_text);
             let path = crate::core::types::url_path(&item.full_text);
             let cache_path = favicon::favicon_cache_path(&domain);
             let cp = std::path::PathBuf::from(&cache_path);
-            let (fav_path_str, fav_img) = if cp.exists() {
-                let img = image_cache.get_or_load(&cache_path);
-                (cache_path, img)
-            } else {
-                (String::new(), Image::default())
-            };
+            let fav_path_str = if cp.exists() { cache_path } else { String::new() };
             (SharedString::from(domain), SharedString::from(path),
-             SharedString::from(fav_path_str), fav_img,
-             SharedString::default(), Image::default())
+             SharedString::from(fav_path_str), SharedString::default())
         }
         crate::core::types::ContentType::Path => {
             let icon_dir = images_dir().join("icons");
@@ -1031,19 +1058,16 @@ fn build_link_preview(item: &crate::core::types::ClipboardItem, image_cache: &mu
                     }
                 }
             }
-            let (fol_path_str, fol_img) = if icon_path.exists() {
-                let img = image_cache.get_or_load(&icon_path.to_string_lossy());
-                (icon_path.to_string_lossy().to_string(), img)
+            let fol_path_str = if icon_path.exists() {
+                icon_path.to_string_lossy().to_string()
             } else {
-                (String::new(), Image::default())
+                String::new()
             };
             (SharedString::default(), SharedString::default(),
-             SharedString::default(), Image::default(),
-             SharedString::from(fol_path_str), fol_img)
+             SharedString::default(), SharedString::from(fol_path_str))
         }
         _ => (SharedString::default(), SharedString::default(),
-              SharedString::default(), Image::default(),
-              SharedString::default(), Image::default())
+              SharedString::default(), SharedString::default())
     }
 }
 
@@ -1065,16 +1089,22 @@ fn build_tag_dots(tags: &[crate::core::types::TagInfo]) -> (bool, slint::Color, 
     (!tags.is_empty(), colors[0], colors[1], colors[2], names.remove(0), names.remove(0), names.remove(0), overflow)
 }
 
-fn item_to_entry(item: &crate::core::types::ClipboardItem, image_cache: &mut ImageCache) -> ClipboardEntry {
+fn item_to_entry(item: &crate::core::types::ClipboardItem) -> ClipboardEntry {
+    // Only load thumbnail (auto-resized to 512px) — icons are loaded lazily via load_entry_icons()
     let (thumbnail, img_w, img_h) = if !item.image_path.is_empty() {
-        let img = image_cache.get_or_load(&item.image_path);
+        let img = load_thumbnail_resized(&item.image_path, 512);
         let (w, h) = image::image_dimensions(&item.image_path).unwrap_or((0, 0));
         (img, w, h)
     } else {
         (Image::default(), 0, 0)
     };
 
-    let (source_icon_path, source_app_icon_image) = build_source_icon(item, image_cache);
+    // Store paths for icons but defer loading (the ImageCache would otherwise keep
+    // 5 GPU textures per entry alive permanently — only the visible range needs them)
+    let source_icon_path = build_source_icon_path(item);
+    let (file_count, file_icon_text, file_name_1, file_name_2, file_name_3, file_overflow) = build_file_fields(item);
+    let file_icon_path = build_file_icon_path(item);
+    let (link_domain, link_path, favicon_path, folder_icon_path) = build_link_preview_paths(item);
 
     let color_swatch = if item.content_type == crate::core::types::ContentType::Color {
         crate::core::color::detect_color(&item.full_text)
@@ -1084,9 +1114,6 @@ fn item_to_entry(item: &crate::core::types::ClipboardItem, image_cache: &mut Ima
         slint::Color::default()
     };
 
-    let (file_count, file_icon_text, file_name_1, file_name_2, file_name_3, file_overflow) = build_file_fields(item);
-    let (file_icon_path, file_icon_image) = build_file_icon(item, image_cache);
-    let (link_domain, link_path, favicon_path, favicon_image, folder_icon_path, folder_icon_image) = build_link_preview(item, image_cache);
     let (has_tags, tag_dot_0, tag_dot_1, tag_dot_2, tag_name_0, tag_name_1, tag_name_2, tags_overflow) = build_tag_dots(&item.tags);
 
     ClipboardEntry {
@@ -1103,14 +1130,14 @@ fn item_to_entry(item: &crate::core::types::ClipboardItem, image_cache: &mut Ima
         note: SharedString::from(item.note.clone()),
         source_app_name: SharedString::from(item.source_app_name.clone()),
         source_app_icon_path: SharedString::from(source_icon_path),
-        source_app_icon_image,
+        source_app_icon_image: Image::default(),
         color_swatch,
         link_domain,
         link_path,
         favicon_path,
-        favicon_image,
+        favicon_image: Image::default(),
         folder_icon_path,
-        folder_icon_image,
+        folder_icon_image: Image::default(),
         selected: false,
         selection_order: -1,
         file_count,
@@ -1120,7 +1147,7 @@ fn item_to_entry(item: &crate::core::types::ClipboardItem, image_cache: &mut Ima
         file_name_3: SharedString::from(file_name_3),
         file_overflow,
         file_icon_path: SharedString::from(file_icon_path),
-        file_icon_image,
+        file_icon_image: Image::default(),
         has_tags,
         tag_dot_0,
         tag_dot_1,
