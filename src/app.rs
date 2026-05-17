@@ -93,7 +93,6 @@ impl AppController {
             needs_model_refresh_flag.clone(),
             needs_release.clone(),
         );
-        let clipboard_service_for_callbacks = clipboard_service.clone();
         // Load initial data and apply settings
         clipboard_service.load_initial();
         clipboard_service.set_sort_and_refresh(sort_by_created_setting);
@@ -183,7 +182,7 @@ impl AppController {
         };
 
         // Bind all Slint callbacks by category
-        Self::bind_window_callbacks(slint_app, &ctx, &clipboard_service_for_callbacks);
+        Self::bind_window_callbacks(slint_app, &ctx);
         Self::bind_hotkey_callbacks(slint_app, &ctx);
         Self::bind_settings_callbacks(slint_app, &ctx);
         Self::bind_sync_callbacks(slint_app, &ctx);
@@ -228,7 +227,6 @@ impl AppController {
     fn bind_window_callbacks(
         slint_app: &App,
         ctx: &CallbackCtx,
-        cs: &ClipboardService,
     ) {
         let ctx_move = ctx.clone();
         slint_app.on_move_window(move |dx, dy| {
@@ -255,14 +253,15 @@ impl AppController {
         });
 
         let ctx_copy = ctx.clone();
-        let mut cs_for_copy = cs.clone();
         slint_app.on_copy_item(move |id| {
             if let Ok(db) = ctx_copy.db.lock() {
                 if let Ok(Some(item)) = db.get_by_id(id as i64) {
                     write_item_to_clipboard(&item, ctx_copy.copy_as_plain_text.load(Ordering::Relaxed));
                 }
             }
-            cs_for_copy.refresh_row(id);
+            let _ = ctx_copy.looper.try_with_clipboard_service(|cs| {
+                cs.refresh_row(id);
+            });
         });
 
         let ctx_paste = ctx.clone();
